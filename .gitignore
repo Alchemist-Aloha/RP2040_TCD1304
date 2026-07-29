@@ -9,3 +9,5 @@ build.ninja
 cmake_install.cmake
 compile_commands.json
 pico_flash_region.ld
+tmp/
+__pycache__/
