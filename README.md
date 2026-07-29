@@ -32,7 +32,8 @@ The RP2040's ADC operates at 500 ksps, capturing data via DMA, which synchronize
 
 PIO state machine 0 generates the 2 MHz master clock. A second PIO state
 machine aligns ICG and SH to that clock with datasheet-compliant timing
-(`t2 = 500 ns`, `t3 = 1 us`, and `t1 = 5 us`). It also maintains a 40 us
+(`t2 = 500 ns`, `t3 = 1 us`, `t1 = 5 us`, and phase-aligned `t4 = 0 ns`).
+It also maintains a 10 us
 electronic-shutter cadence during the complete line readout. The RP2040 ADC
 still limits readout to 12-bit samples at 500 ksps.
 
@@ -43,8 +44,8 @@ still limits readout to 12-bit samples at 500 ksps.
 The main acquisition settings are at the top of `TCD1304.c`:
 
 - `MC_FREQUENCY_HZ`: master clock frequency (2 MHz by default)
-- `EXPOSURE_US`: electronic-shutter exposure (40 us by default)
+- `EXPOSURE_US`: electronic-shutter exposure (10 us, the datasheet minimum)
 - `FRAME_AVERAGES`: number of frames in each true arithmetic mean
 
-The current PIO delay constants implement 40 us directly. If `EXPOSURE_US` is
+The current PIO delay constants implement 10 us directly. If `EXPOSURE_US` is
 changed, update the PIO shutter delays and ADC lead-in compensation together.

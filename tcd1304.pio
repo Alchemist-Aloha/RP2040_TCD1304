@@ -10,53 +10,55 @@
 .program tcd1304_gates
 .side_set 1
 
-; This state machine runs at 2 MHz (one instruction cycle = 500 ns).
+; This state machine runs at 4 MHz (one instruction cycle = 250 ns).
 ; SET controls SH and side-set controls ICG. Each request consists of two FIFO
 ; words: a token followed by the number of electronic-shutter pulses required
 ; during readout.
 ;
-; One preflush pulse followed by the transfer pulse gives a 40 us effective
+; One preflush pulse followed by the transfer pulse gives a 10 us effective
 ; exposure. The frame-transfer timing is:
 ;   t2 = 500 ns, t3 = 1 us, t1 = 5 us.
 .wrap_target
     pull block          side 1
 
-    ; Preflush SH pulse at t = 0 us: 1 us high, then 38.5 us low.
-    set pins, 1         side 1 [1]
+    ; Anchor the complete sequence to the master-clock phase. The instruction
+    ; after WAIT begins with MC high.
+    wait 0 gpio 14      side 1
+
+    ; Preflush SH pulse at t = 0 us: 1 us high.
+    set pins, 1         side 1 [3]
     set pins, 0         side 1
-    set x, 17           side 1
+    set x, 7            side 1
 preflush_delay:
     jmp x-- preflush_delay side 1 [3]
-    nop                 side 1 [2]
 
-    ; ICG falls 500 ns before the frame-transfer SH rising edge.
-    nop                 side 0
-    set pins, 1         side 0
-    nop                 side 0
+    ; ICG falls at t = 9.5 us, 500 ns before frame-transfer SH.
+    nop                 side 0 [1]
+    set pins, 1         side 0 [3]
     set pins, 0         side 0
 
-    ; Hold ICG low for 5 us after SH falls, then raise it on the common
-    ; 500 ns timing grid shared with the master-clock state machine.
+    ; Hold ICG low for exactly 5 us after SH falls. Since the sequence was
+    ; phase-anchored above, ICG rises with the MC rising edge at t = 16 us
+    ; (t4 = 0 ns on the programmed timing grid).
     set x, 3            side 0
 icg_delay:
-    jmp x-- icg_delay   side 0 [1]
+    jmp x-- icg_delay   side 0 [3]
+    nop                 side 0 [1]
     nop                 side 1
 
-    ; First shutter pulse after frame transfer must occur at t = 80 us.
+    ; First shutter pulse after frame transfer occurs at t = 20 us.
     pull block          side 1
     mov y, osr          side 1
-    set x, 15           side 1
-first_shutter_delay:
-    jmp x-- first_shutter_delay side 1 [3]
+    nop                 side 1 [12]
 
-    ; 1 us SH high and 39 us low: exactly 40 us rising-edge to rising-edge.
+    ; 1 us SH high and 9 us low: exactly 10 us rising-edge to rising-edge.
 shutter_loop:
-    set pins, 1         side 1 [1]
+    set pins, 1         side 1 [3]
     set pins, 0         side 1
-    set x, 17           side 1
+    set x, 5            side 1
 shutter_low:
     jmp x-- shutter_low side 1 [3]
-    jmp y-- shutter_loop side 1 [3]
+    jmp y-- shutter_loop side 1 [9]
 .wrap
 
 % c-sdk {

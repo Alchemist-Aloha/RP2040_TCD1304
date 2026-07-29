@@ -20,14 +20,15 @@
 #define MC_FREQUENCY_HZ 2000000u
 #define SAMPLE_COUNT 3694u
 #define FRAME_AVERAGES 10u
-#define EXPOSURE_US 40u
+#define EXPOSURE_US 10u
 
-/* ADC starts with the preflush pulse. At 500 ksps, the 46 us from preflush
-   through ICG rising produces 23 lead-in conversions before D0. Capturing
+/* ADC starts just before the phase-anchored preflush pulse. At 500 ksps, the
+   approximately 16 us through ICG rising produces 8 lead-in conversions before
+   D0. Capturing
    these explicitly prevents the active spectrum from being shifted/truncated. */
-#define ADC_LEAD_SAMPLES 23u
+#define ADC_LEAD_SAMPLES 8u
 #define ADC_CAPTURE_COUNT (SAMPLE_COUNT + ADC_LEAD_SAMPLES)
-#define READOUT_SHUTTER_PULSES 184u
+#define READOUT_SHUTTER_PULSES 739u
 
 #define FRAME_MAGIC 0x34444354u /* "TCD4" on the wire, little-endian */
 #define PROTOCOL_VERSION 2u
@@ -103,7 +104,7 @@ int main(void) {
     const float mc_clkdiv =
         (float)clock_get_hz(clk_sys) / (2.0f * (float)MC_FREQUENCY_HZ);
     const float gate_clkdiv =
-        (float)clock_get_hz(clk_sys) / (float)MC_FREQUENCY_HZ;
+        (float)clock_get_hz(clk_sys) / (2.0f * (float)MC_FREQUENCY_HZ);
 
     tcd1304_master_clock_init(pio, mc_sm, mc_offset, MC_PIN, mc_clkdiv);
     tcd1304_gates_init(pio, gate_sm, gate_offset, SH_PIN, ICG_PIN,
@@ -130,7 +131,7 @@ int main(void) {
     uint32_t frame_number = 0;
 
     sleep_ms(1000);
-    /* Discard one line to remove power-up contents and establish the
+    /* Discard one line to remove power-up contents and establish the 10 us
        electronic-shutter cadence. */
     capture_once(pio, gate_sm, dma_channel, &dma_config, capture);
 
