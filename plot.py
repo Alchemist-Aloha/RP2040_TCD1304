@@ -2,7 +2,7 @@ import matplotlib.pyplot as plt
 import serial  # To read data from serial port
 import numpy as np
 
-PORT = 'COM10'  # Replace with your COM port
+PORT = 'COM14'  # Replace with your COM port
 
 # Function to read capture_buf data from the serial port
 def read_capture_buf(ser):

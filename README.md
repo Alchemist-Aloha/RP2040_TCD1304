@@ -20,7 +20,7 @@ This project utilizes the typical drive circuit from the TCD1304 datasheet, excl
 
 The RP2040's ADC operates at 500 ksps, capturing data via DMA, which synchronizes with the 2 MHz Master Clock (MC) of the TCD1304. The integration time (Shift Gate cycle) is currently set to 100 µs, while the full 3648-pixel readout time is approximately 80 ms.
 
-Current timing provides basic functionality, but the stability of the signal is not ideal due to the unsynchronized nature of SH, ICG, and MC. Additionally, the ADC capability of the Raspberry Pi Pico limits the readout quality, providing only 8-bit resolution at 500 ksps with DMA.
+Current timing provides basic functionality, but the stability of the signal is not ideal due to the unsynchronized nature of SH, ICG, and MC. Additionally, the ADC capability of the Raspberry Pi Pico limits the readout quality, providing only 12-bit resolution at 500 ksps with DMA.
 
 ![image](doc/timing.png)
 

@@ -3,7 +3,7 @@ import serial
 import numpy as np
 import struct
 
-PORT = 'COM10'  # Replace with your COM port
+PORT = 'COM14'  # Replace with your COM port
 START_MARKER = 0xAA55
 
 def read_binary_capture(ser: serial.Serial) -> np.ndarray:
