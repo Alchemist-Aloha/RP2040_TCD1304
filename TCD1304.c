@@ -20,7 +20,14 @@
 #define MC_FREQUENCY_HZ 2000000u
 #define SAMPLE_COUNT 3694u
 #define FRAME_AVERAGES 10u
-#define INTEGRATION_US 10000u
+#define EXPOSURE_US 40u
+
+/* ADC starts with the preflush pulse. At 500 ksps, the 46 us from preflush
+   through ICG rising produces 23 lead-in conversions before D0. Capturing
+   these explicitly prevents the active spectrum from being shifted/truncated. */
+#define ADC_LEAD_SAMPLES 23u
+#define ADC_CAPTURE_COUNT (SAMPLE_COUNT + ADC_LEAD_SAMPLES)
+#define READOUT_SHUTTER_PULSES 184u
 
 #define FRAME_MAGIC 0x34444354u /* "TCD4" on the wire, little-endian */
 #define PROTOCOL_VERSION 2u
@@ -53,7 +60,7 @@ static void send_frame(const uint16_t *samples, uint32_t frame_number) {
         .frame_number = frame_number,
         .sample_count = SAMPLE_COUNT,
         .averages = FRAME_AVERAGES,
-        .integration_us = INTEGRATION_US,
+        .integration_us = EXPOSURE_US,
         .payload_bytes = sizeof(uint16_t) * SAMPLE_COUNT,
     };
     uint32_t crc = crc32_update(0xffffffffu, (const uint8_t *)&header,
@@ -68,14 +75,16 @@ static void send_frame(const uint16_t *samples, uint32_t frame_number) {
 
 static void capture_once(PIO pio, uint gate_sm, uint dma_channel,
                          const dma_channel_config *dma_config,
-                         uint16_t *samples) {
+                         uint16_t *capture) {
     adc_fifo_drain();
-    dma_channel_configure(dma_channel, dma_config, samples, &adc_hw->fifo,
-                          SAMPLE_COUNT, true);
+    dma_channel_configure(dma_channel, dma_config, capture, &adc_hw->fifo,
+                          ADC_CAPTURE_COUNT, true);
     adc_run(true);
 
-    /* A FIFO word requests the PIO-timed ICG/SH sequence. */
+    /* Request one frame and provide the number of 40 us shutter cycles that
+       keep the electronic shutter active throughout the line readout. */
     pio_sm_put_blocking(pio, gate_sm, 1u);
+    pio_sm_put_blocking(pio, gate_sm, READOUT_SHUTTER_PULSES - 1u);
     dma_channel_wait_for_finish_blocking(dma_channel);
 
     adc_run(false);
@@ -93,9 +102,12 @@ int main(void) {
     const uint gate_offset = pio_add_program(pio, &tcd1304_gates_program);
     const float mc_clkdiv =
         (float)clock_get_hz(clk_sys) / (2.0f * (float)MC_FREQUENCY_HZ);
+    const float gate_clkdiv =
+        (float)clock_get_hz(clk_sys) / (float)MC_FREQUENCY_HZ;
 
     tcd1304_master_clock_init(pio, mc_sm, mc_offset, MC_PIN, mc_clkdiv);
-    tcd1304_gates_init(pio, gate_sm, gate_offset, SH_PIN, ICG_PIN);
+    tcd1304_gates_init(pio, gate_sm, gate_offset, SH_PIN, ICG_PIN,
+                       gate_clkdiv);
     pio_enable_sm_mask_in_sync(pio, (1u << mc_sm) | (1u << gate_sm));
 
     adc_init();
@@ -112,27 +124,22 @@ int main(void) {
     channel_config_set_write_increment(&dma_config, true);
     channel_config_set_dreq(&dma_config, DREQ_ADC);
 
-    static uint16_t capture[SAMPLE_COUNT];
+    static uint16_t capture[ADC_CAPTURE_COUNT];
     static uint16_t averaged[SAMPLE_COUNT];
     static uint32_t sums[SAMPLE_COUNT];
     uint32_t frame_number = 0;
 
     sleep_ms(1000);
-    /* Prime the CCD once; subsequent SH edges define exact integration
-       intervals. This discarded read also removes power-up contents. */
+    /* Discard one line to remove power-up contents and establish the
+       electronic-shutter cadence. */
     capture_once(pio, gate_sm, dma_channel, &dma_config, capture);
-    absolute_time_t next_shift = get_absolute_time();
 
     while (true) {
         memset(sums, 0, sizeof(sums));
         for (uint average = 0; average < FRAME_AVERAGES; ++average) {
-            /* Schedule SH-to-SH, rather than adding the 7.4 ms readout time
-               to the requested integration interval. */
-            next_shift = delayed_by_us(next_shift, INTEGRATION_US);
-            sleep_until(next_shift);
             capture_once(pio, gate_sm, dma_channel, &dma_config, capture);
             for (uint i = 0; i < SAMPLE_COUNT; ++i)
-                sums[i] += capture[i];
+                sums[i] += capture[i + ADC_LEAD_SAMPLES];
         }
         for (uint i = 0; i < SAMPLE_COUNT; ++i)
             averaged[i] =
