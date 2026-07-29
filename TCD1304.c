@@ -21,14 +21,18 @@
 #define SAMPLE_COUNT 3694u
 #define FRAME_AVERAGES 10u
 #define EXPOSURE_US 10u
+#define PREFLUSH_PULSES 16u
 
-/* ADC starts just before the phase-anchored preflush pulse. At 500 ksps, the
-   approximately 16 us through ICG rising produces 8 lead-in conversions before
-   D0. Capturing
-   these explicitly prevents the active spectrum from being shifted/truncated. */
-#define ADC_LEAD_SAMPLES 8u
+/* ADC starts during the final preflush pulse. At 500 ksps, the approximately
+   14.5 us through ICG rising produces 7 lead-in conversions before D0.
+   Capturing these explicitly prevents the active spectrum from being
+   shifted/truncated. */
+#define ADC_LEAD_SAMPLES 7u
 #define ADC_CAPTURE_COUNT (SAMPLE_COUNT + ADC_LEAD_SAMPLES)
 #define READOUT_SHUTTER_PULSES 739u
+
+_Static_assert(PREFLUSH_PULSES >= 2u,
+               "PIO requires at least two preflush pulses");
 
 #define FRAME_MAGIC 0x34444354u /* "TCD4" on the wire, little-endian */
 #define PROTOCOL_VERSION 2u
@@ -74,19 +78,35 @@ static void send_frame(const uint16_t *samples, uint32_t frame_number) {
     fflush(stdout);
 }
 
-static void capture_once(PIO pio, uint gate_sm, uint dma_channel,
-                         const dma_channel_config *dma_config,
-                         uint16_t *capture) {
-    adc_fifo_drain();
-    dma_channel_configure(dma_channel, dma_config, capture, &adc_hw->fifo,
-                          ADC_CAPTURE_COUNT, true);
-    adc_run(true);
+static const uint32_t adc_start_mask = ADC_CS_START_MANY_BITS;
 
-    /* Request one frame and provide the number of 40 us shutter cycles that
-       keep the electronic shutter active throughout the line readout. */
+static void capture_once(PIO pio, uint gate_sm, uint sample_dma_channel,
+                         const dma_channel_config *sample_dma_config,
+                         uint adc_start_dma_channel,
+                         const dma_channel_config *adc_start_dma_config,
+                         uint16_t *capture) {
+    adc_run(false);
+    adc_fifo_drain();
+
+    /* Remove the previous PIO trigger token before arming its RX DREQ. */
+    while (!pio_sm_is_rx_fifo_empty(pio, gate_sm))
+        (void)pio_sm_get(pio, gate_sm);
+
+    /* Arm result collection first. It remains idle until ADC DREQ arrives. */
+    dma_channel_configure(sample_dma_channel, sample_dma_config, capture,
+                          &adc_hw->fifo, ADC_CAPTURE_COUNT, true);
+
+    /* Arm a one-word DMA write to the ADC atomic SET alias. The channel is
+       paced by gate-SM RX DREQ, so PIO determines the ADC start phase. */
+    dma_channel_configure(adc_start_dma_channel, adc_start_dma_config,
+                          &hw_set_alias(adc_hw)->cs, &adc_start_mask, 1, true);
+
+    /* Request one frame, 15 preliminary preflush pulses plus one final pulse,
+       and the 10 us shutter cycles required throughout line readout. */
     pio_sm_put_blocking(pio, gate_sm, 1u);
+    pio_sm_put_blocking(pio, gate_sm, PREFLUSH_PULSES - 2u);
     pio_sm_put_blocking(pio, gate_sm, READOUT_SHUTTER_PULSES - 1u);
-    dma_channel_wait_for_finish_blocking(dma_channel);
+    dma_channel_wait_for_finish_blocking(sample_dma_channel);
 
     adc_run(false);
     adc_fifo_drain();
@@ -96,20 +116,27 @@ int main(void) {
     set_sys_clock_khz(SYS_CLOCK_KHZ, true);
     stdio_init_all();
     stdio_set_translate_crlf(&stdio_usb, false);
-    PIO pio = pio0;
-    const uint mc_sm = pio_claim_unused_sm(pio, true);
-    const uint gate_sm = pio_claim_unused_sm(pio, true);
-    const uint mc_offset = pio_add_program(pio, &tcd1304_master_clock_program);
-    const uint gate_offset = pio_add_program(pio, &tcd1304_gates_program);
+    /* The gate program uses 31 instructions and the clock uses 2, so place
+       them on separate PIO blocks rather than exceeding one block's
+       32-instruction memory. Gate timing phase-locks to MC_PIN explicitly. */
+    PIO gate_pio = pio0;
+    PIO mc_pio = pio1;
+    const uint gate_sm = pio_claim_unused_sm(gate_pio, true);
+    const uint mc_sm = pio_claim_unused_sm(mc_pio, true);
+    const uint gate_offset =
+        pio_add_program(gate_pio, &tcd1304_gates_program);
+    const uint mc_offset =
+        pio_add_program(mc_pio, &tcd1304_master_clock_program);
     const float mc_clkdiv =
         (float)clock_get_hz(clk_sys) / (2.0f * (float)MC_FREQUENCY_HZ);
     const float gate_clkdiv =
         (float)clock_get_hz(clk_sys) / (2.0f * (float)MC_FREQUENCY_HZ);
 
-    tcd1304_master_clock_init(pio, mc_sm, mc_offset, MC_PIN, mc_clkdiv);
-    tcd1304_gates_init(pio, gate_sm, gate_offset, SH_PIN, ICG_PIN,
+    tcd1304_master_clock_init(mc_pio, mc_sm, mc_offset, MC_PIN, mc_clkdiv);
+    tcd1304_gates_init(gate_pio, gate_sm, gate_offset, SH_PIN, ICG_PIN,
                        gate_clkdiv);
-    pio_enable_sm_mask_in_sync(pio, (1u << mc_sm) | (1u << gate_sm));
+    pio_sm_set_enabled(mc_pio, mc_sm, true);
+    pio_sm_set_enabled(gate_pio, gate_sm, true);
 
     adc_init();
     adc_gpio_init(ADC_PIN);
@@ -117,13 +144,22 @@ int main(void) {
     adc_fifo_setup(true, true, 1, false, false);
     adc_set_clkdiv(0.0f);
 
-    const uint dma_channel = dma_claim_unused_channel(true);
-    dma_channel_config dma_config =
-        dma_channel_get_default_config(dma_channel);
-    channel_config_set_transfer_data_size(&dma_config, DMA_SIZE_16);
-    channel_config_set_read_increment(&dma_config, false);
-    channel_config_set_write_increment(&dma_config, true);
-    channel_config_set_dreq(&dma_config, DREQ_ADC);
+    const uint sample_dma_channel = dma_claim_unused_channel(true);
+    dma_channel_config sample_dma_config =
+        dma_channel_get_default_config(sample_dma_channel);
+    channel_config_set_transfer_data_size(&sample_dma_config, DMA_SIZE_16);
+    channel_config_set_read_increment(&sample_dma_config, false);
+    channel_config_set_write_increment(&sample_dma_config, true);
+    channel_config_set_dreq(&sample_dma_config, DREQ_ADC);
+
+    const uint adc_start_dma_channel = dma_claim_unused_channel(true);
+    dma_channel_config adc_start_dma_config =
+        dma_channel_get_default_config(adc_start_dma_channel);
+    channel_config_set_transfer_data_size(&adc_start_dma_config, DMA_SIZE_32);
+    channel_config_set_read_increment(&adc_start_dma_config, false);
+    channel_config_set_write_increment(&adc_start_dma_config, false);
+    channel_config_set_dreq(
+        &adc_start_dma_config, pio_get_dreq(gate_pio, gate_sm, false));
 
     static uint16_t capture[ADC_CAPTURE_COUNT];
     static uint16_t averaged[SAMPLE_COUNT];
@@ -133,12 +169,15 @@ int main(void) {
     sleep_ms(1000);
     /* Discard one line to remove power-up contents and establish the 10 us
        electronic-shutter cadence. */
-    capture_once(pio, gate_sm, dma_channel, &dma_config, capture);
+    capture_once(gate_pio, gate_sm, sample_dma_channel, &sample_dma_config,
+                 adc_start_dma_channel, &adc_start_dma_config, capture);
 
     while (true) {
         memset(sums, 0, sizeof(sums));
         for (uint average = 0; average < FRAME_AVERAGES; ++average) {
-            capture_once(pio, gate_sm, dma_channel, &dma_config, capture);
+            capture_once(gate_pio, gate_sm, sample_dma_channel,
+                         &sample_dma_config,
+                         adc_start_dma_channel, &adc_start_dma_config, capture);
             for (uint i = 0; i < SAMPLE_COUNT; ++i)
                 sums[i] += capture[i + ADC_LEAD_SAMPLES];
         }

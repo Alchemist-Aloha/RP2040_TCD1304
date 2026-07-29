@@ -37,6 +37,17 @@ It also maintains a 10 us
 electronic-shutter cadence during the complete line readout. The RP2040 ADC
 still limits readout to 12-bit samples at 500 ksps.
 
+ADC startup is hardware-synchronized: the gate PIO pushes a trigger token at a
+fixed master-clock phase, its RX DREQ starts a one-transfer DMA channel, and
+that DMA sets the ADC `START_MANY` bit. A second DMA channel collects ADC FIFO
+results. CPU scheduling therefore cannot shift the spectrum between frames.
+Before each captured line, PIO generates 16 preflush SH pulses at the same
+10 us cadence to clear charge accumulated while frame data was being sent.
+
+The 31-instruction gate program runs on PIO0 and the 2-instruction master-clock
+program runs on PIO1. This is required because a single RP2040 PIO block has
+only 32 instruction slots.
+
 ![image](doc/timing.png)
 
 ## Configuration
@@ -45,6 +56,7 @@ The main acquisition settings are at the top of `TCD1304.c`:
 
 - `MC_FREQUENCY_HZ`: master clock frequency (2 MHz by default)
 - `EXPOSURE_US`: electronic-shutter exposure (10 us, the datasheet minimum)
+- `PREFLUSH_PULSES`: clearing pulses before each captured line (16 by default)
 - `FRAME_AVERAGES`: number of frames in each true arithmetic mean
 
 The current PIO delay constants implement 10 us directly. If `EXPOSURE_US` is
