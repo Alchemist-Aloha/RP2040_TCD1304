@@ -99,7 +99,7 @@ def save_csv(path: Path, frame: Frame, x: np.ndarray, y: np.ndarray) -> None:
              "integration_us", frame.integration_us]
         )
         writer.writerow(["pixel", "signal"])
-        writer.writerows(zip(x.astype(int), y))
+        writer.writerows(zip(x.astype(int), y, strict=True))
 
 
 def parse_args() -> argparse.Namespace:

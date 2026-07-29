@@ -1,0 +1,28 @@
+[project]
+name = "tcd1304-spectrum-tools"
+version = "0.1.0"
+description = "Qt spectrum acquisition and plotting tools for the TCD1304 Pico firmware"
+readme = "README.md"
+requires-python = ">=3.14"
+dependencies = [
+    "matplotlib>=3.10",
+    "numpy>=2.0",
+    "pyqtgraph>=0.13.7",
+    "pyserial>=3.5",
+    "pyside6>=6.8",
+]
+
+[tool.uv]
+package = false
+
+[dependency-groups]
+dev = [
+    "ruff>=0.12",
+]
+
+[tool.ruff]
+target-version = "py314"
+line-length = 88
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]

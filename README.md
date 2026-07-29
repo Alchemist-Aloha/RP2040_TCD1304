@@ -16,6 +16,45 @@ Use `python plot_spectrum.py --help` for baseline subtraction and CSV export.
 The viewer validates CRC-32 on every binary frame and automatically
 resynchronizes after dropped or partial serial data.
 
+### Qt spectrum application
+
+For a reproducible environment, use
+[uv](https://docs.astral.sh/uv/) to install the locked dependencies and launch
+Spectrum Studio:
+
+```powershell
+uv sync
+uv run python spectrum_gui.py
+```
+
+The lightweight Matplotlib viewer can be launched in the same environment:
+
+```powershell
+uv run python plot_spectrum.py --port COM14 --invert --first-pixel 32 --last-pixel 3680
+```
+
+To include development tools such as Ruff:
+
+```powershell
+uv sync --group dev
+uv run ruff check .
+```
+
+Alternatively, install the GUI dependencies with pip:
+
+```powershell
+python -m pip install -r requirements-gui.txt
+python spectrum_gui.py
+```
+
+The application provides serial-port discovery, CRC/error counters, live frame
+rate and device metadata, pixel cropping, host averaging, baseline and dark
+subtraction, smoothing, inversion, normalization, polynomial wavelength
+calibration, peak tracking, manual or automatic axes, persistent settings, CSV
+export, and PNG screenshots. Protocol v2 does not accept runtime acquisition
+commands, so exposure, preflush count, PIO timing, and firmware averaging are
+displayed as device metadata rather than editable controls.
+
 The image below shows the spectrum captured from the TCD1304 with a 100 µs integration time and averaging over 10 frames. The spectrum is inverted on the y-axis, meaning low photon count corresponds to high ADC values. The peak in the middle of the spectrum is due to a shadow on the CCD detector.
 
 ![image](doc/captured_100us_10avg.png)
