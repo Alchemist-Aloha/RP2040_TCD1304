@@ -1,230 +1,142 @@
+#include <stdint.h>
 #include <stdio.h>
 #include <string.h>
-#include "pico/stdlib.h"
-#include "hardware/pio.h"
-#include "hardware/timer.h"
-#include "hardware/clocks.h"
-#include "hardware/pwm.h"
-// For ADC input:
+
 #include "hardware/adc.h"
+#include "hardware/clocks.h"
 #include "hardware/dma.h"
-// For resistor DAC output:
-#include "pico/multicore.h"
-// TCD1304 pinout
-#define PWM_PIN 14
-#define PWM_TEST_PIN 7
+#include "hardware/pio.h"
+#include "pico/stdlib.h"
+#include "tcd1304.pio.h"
+#include "pico/stdio_usb.h"
+
+#define MC_PIN 14
 #define SH_PIN 9
 #define ICG_PIN 13
 #define ADC_PIN 26
+#define ADC_CHANNEL 0
 
-#define PRINT_INTERVAL 30   // Print a line with 30 pixels
-#define CPU_FREQ_KHZ 200000 // CPU 200000 kHz
-#define CAPTURE_CHANNEL 0   // Channel 0 is GPIO26
-#define CAPTURE_DEPTH 3694  // 3694 samples including the dummy pixel by datasheet
-#define SH_PULSE_ON 20      // pulse on and off time (us)
-#define SH_PULSE_OFF 20     // pulse on and off time (us)
-#define SIGNAL_AVERAGE 10   // average the signal
+#define SYS_CLOCK_KHZ 200000u
+#define MC_FREQUENCY_HZ 2000000u
+#define SAMPLE_COUNT 3694u
+#define FRAME_AVERAGES 10u
+#define INTEGRATION_US 10000u
 
-const int SH_PULSE_COUNT = CAPTURE_DEPTH * 2 / (SH_PULSE_ON + SH_PULSE_OFF); // SH pulse cycle matches the readout time. The single cycle duration defines the exposure time.
-// PWM configuration
-void setup_pwm_mc(uint slice_num, uint channel)
-{
-    // Set the wrap value to generate 2 MHz frequency
-    uint32_t wrap_value = CPU_FREQ_KHZ / 2000;              // 2 MHz PWM frequency. wrap_value = (sys_clock / PWM frequency)-1
-    pwm_set_wrap(slice_num, wrap_value);                    // Set the wrap value (16-bit)
-    pwm_set_chan_level(slice_num, channel, wrap_value / 2); // Set duty cycle (50%)
-    pwm_set_enabled(slice_num, true);                       // Enable PWM output
+#define FRAME_MAGIC 0x34444354u /* "TCD4" on the wire, little-endian */
+#define PROTOCOL_VERSION 2u
+
+typedef struct __attribute__((packed)) {
+    uint32_t magic;
+    uint16_t version;
+    uint16_t header_bytes;
+    uint32_t frame_number;
+    uint16_t sample_count;
+    uint16_t averages;
+    uint32_t integration_us;
+    uint32_t payload_bytes;
+} frame_header_t;
+
+static uint32_t crc32_update(uint32_t crc, const uint8_t *data, size_t length) {
+    while (length--) {
+        crc ^= *data++;
+        for (uint bit = 0; bit < 8; ++bit)
+            crc = (crc >> 1) ^ (0xedb88320u & (0u - (crc & 1u)));
+    }
+    return crc;
 }
 
-// PWM configuration of SH. Unused in this version
-void setup_pwm_sh(uint slice_num, uint channel)
-{
-    // Set the wrap value to generate 100 kHz frequency
-    uint32_t wrap_value = CPU_FREQ_KHZ / 100;                 // 2 MHz SH frequency. wrap_value = (sys_clock / PWM frequency)-1
-    pwm_set_wrap(slice_num, wrap_value);                      // Set the wrap value (16-bit)
-    pwm_set_chan_level(slice_num, channel, wrap_value * 0.4); // Set duty cycle (50%)
-    pwm_set_enabled(slice_num, true);                         // Enable PWM output
-}
-// PWM test pin configuration. Unused in this version
-void setup_pwm2(uint slice_num, uint channel)
-{
-    // Set the wrap value to generate 100 kHz frequency
-    uint32_t wrap_value = CPU_FREQ_KHZ / 5;                 // 5 kHz frequency for diagnose use. wrap_value = (sys_clock / PWM frequency)-1
-    pwm_set_wrap(slice_num, wrap_value);                    // Set the wrap value (16-bit)
-    pwm_set_chan_level(slice_num, channel, wrap_value / 2); // Set duty cycle (50%)
-    pwm_set_enabled(slice_num, true);                       // Enable PWM output
+static void send_frame(const uint16_t *samples, uint32_t frame_number) {
+    const frame_header_t header = {
+        .magic = FRAME_MAGIC,
+        .version = PROTOCOL_VERSION,
+        .header_bytes = sizeof(frame_header_t),
+        .frame_number = frame_number,
+        .sample_count = SAMPLE_COUNT,
+        .averages = FRAME_AVERAGES,
+        .integration_us = INTEGRATION_US,
+        .payload_bytes = sizeof(uint16_t) * SAMPLE_COUNT,
+    };
+    uint32_t crc = crc32_update(0xffffffffu, (const uint8_t *)&header,
+                                sizeof(header));
+    crc = crc32_update(crc, (const uint8_t *)samples,
+                       sizeof(uint16_t) * SAMPLE_COUNT) ^ 0xffffffffu;
+    fwrite(&header, 1, sizeof(header), stdout);
+    fwrite(samples, sizeof(uint16_t), SAMPLE_COUNT, stdout);
+    fwrite(&crc, 1, sizeof(crc), stdout);
+    fflush(stdout);
 }
 
-// dma read from adc fifo
-void dma_adc_read(uint dma_chan, uint16_t *capture_buf, dma_channel_config cfg)
-{
-    // Set up the DMA to start transferring data as soon as it appears in FIFO
-    dma_channel_configure(dma_chan, &cfg,
-                          capture_buf,   // dst
-                          &adc_hw->fifo, // src
-                          CAPTURE_DEPTH, // transfer count
-                          true           // start immediately
-    );
-
-    // printf("Starting capture\n");
+static void capture_once(PIO pio, uint gate_sm, uint dma_channel,
+                         const dma_channel_config *dma_config,
+                         uint16_t *samples) {
+    adc_fifo_drain();
+    dma_channel_configure(dma_channel, dma_config, samples, &adc_hw->fifo,
+                          SAMPLE_COUNT, true);
     adc_run(true);
 
-    // Once DMA finishes, stop any new conversions from starting, and clean up
-    // the FIFO in case the ADC was still mid-conversion.
-    dma_channel_wait_for_finish_blocking(dma_chan);
-    printf("\n\rCapture finished\n\r");
+    /* A FIFO word requests the PIO-timed ICG/SH sequence. */
+    pio_sm_put_blocking(pio, gate_sm, 1u);
+    dma_channel_wait_for_finish_blocking(dma_channel);
+
     adc_run(false);
     adc_fifo_drain();
 }
 
-// initiate CCD readout. Unused in this version
-void start_ccd_readout()
-{
-    // Control SH and ICG pins
-    gpio_put(ICG_PIN, 0); // without 74hc04
-    // delay before exposure for 100 cpu cycles (~430 ns)
-    __asm volatile("nop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\n");
-    gpio_put(SH_PIN, 1); // without 74hc04
-    // SH pulse width
-    busy_wait_us_32(4);
-    gpio_put(SH_PIN, 0); // without 74hc04
-    // delay after exposure
-    busy_wait_us_32(6);
-    gpio_put(ICG_PIN, 1); // without 74hc04
-}
-
-// Control SH pin with a given count and delays. Can be used to control the exposure time.
-void control_sh_pin(int count, int high_delay, int low_delay)
-{
-    for (int i = 0; i < count; ++i)
-    {
-        gpio_put(SH_PIN, 1);
-        busy_wait_us_32(high_delay);
-        gpio_put(SH_PIN, 0);
-        busy_wait_us_32(low_delay);
-    }
-}
-
-// Print the capture buffer. This function prints the captured data in lines with depth number of int8 pixel readings.
-void print_capture_buffer(uint16_t *buffer, int depth)
-{
-    for (int i = 0; i < depth; ++i)
-    {
-        printf("%-3d, ", buffer[i]);
-        if (i % PRINT_INTERVAL == PRINT_INTERVAL - 1)
-            printf("\n\r");
-    }
-}
-
-int main()
-{
-    // Set system clock frequency
-    set_sys_clock_khz(CPU_FREQ_KHZ, true);
+int main(void) {
+    set_sys_clock_khz(SYS_CLOCK_KHZ, true);
     stdio_init_all();
+    stdio_set_translate_crlf(&stdio_usb, false);
+    PIO pio = pio0;
+    const uint mc_sm = pio_claim_unused_sm(pio, true);
+    const uint gate_sm = pio_claim_unused_sm(pio, true);
+    const uint mc_offset = pio_add_program(pio, &tcd1304_master_clock_program);
+    const uint gate_offset = pio_add_program(pio, &tcd1304_gates_program);
+    const float mc_clkdiv =
+        (float)clock_get_hz(clk_sys) / (2.0f * (float)MC_FREQUENCY_HZ);
 
-    // Initialize PWM on the specified pin
-    gpio_set_function(PWM_PIN, GPIO_FUNC_PWM);
-    uint slice_num = pwm_gpio_to_slice_num(PWM_PIN);
-    uint channel = pwm_gpio_to_channel(PWM_PIN);
-    setup_pwm_mc(slice_num, channel);
-
-    // // Initialize PWM test on the specified pin
-    gpio_set_function(PWM_TEST_PIN, GPIO_FUNC_PWM);
-    uint slice_num_test = pwm_gpio_to_slice_num(PWM_TEST_PIN);
-    uint channel_test = pwm_gpio_to_channel(PWM_TEST_PIN);
-    setup_pwm2(slice_num_test, channel_test);
-
-    // // Initialize GPIO for SH
-    gpio_init(SH_PIN);
-    gpio_set_dir(SH_PIN, GPIO_OUT);
-    gpio_put(SH_PIN, 0); // without 74hc04
-
-    // Initialize GPIO for ICG
-    gpio_init(ICG_PIN);
-    gpio_set_dir(ICG_PIN, GPIO_OUT);
-    gpio_put(ICG_PIN, 1); // without 74hc04
-
-    // Init GPIO for analogue use: hi-Z, no pulls, disable digital input buffer.
-    adc_gpio_init(ADC_PIN + CAPTURE_CHANNEL);
+    tcd1304_master_clock_init(pio, mc_sm, mc_offset, MC_PIN, mc_clkdiv);
+    tcd1304_gates_init(pio, gate_sm, gate_offset, SH_PIN, ICG_PIN);
+    pio_enable_sm_mask_in_sync(pio, (1u << mc_sm) | (1u << gate_sm));
 
     adc_init();
-    adc_select_input(CAPTURE_CHANNEL);
-    adc_fifo_setup(
-        true,  // Write each completed conversion to the sample FIFO
-        true,  // Enable DMA data request (DREQ)
-        1,     // DREQ (and IRQ) asserted when at least 1 sample present
-        false, // We won't see the ERR bit because of 8 bit reads; disable.
-        false   // Shift each sample to 8 bits when pushing to FIFO
-    );
+    adc_gpio_init(ADC_PIN);
+    adc_select_input(ADC_CHANNEL);
+    adc_fifo_setup(true, true, 1, false, false);
+    adc_set_clkdiv(0.0f);
 
-    // Divisor of 0 -> full speed. Free-running capture with the divider is
-    // equivalent to pressing the ADC_CS_START_ONCE button once per `div + 1`
-    // cycles (div not necessarily an integer). Each conversion takes 96
-    // cycles, so in general you want a divider of 0 (hold down the button
-    // continuously) or > 95 (take samples less frequently than 96 cycle
-    // intervals). This is all timed by the 48 MHz ADC clock.
-    adc_set_clkdiv(0);
+    const uint dma_channel = dma_claim_unused_channel(true);
+    dma_channel_config dma_config =
+        dma_channel_get_default_config(dma_channel);
+    channel_config_set_transfer_data_size(&dma_config, DMA_SIZE_16);
+    channel_config_set_read_increment(&dma_config, false);
+    channel_config_set_write_increment(&dma_config, true);
+    channel_config_set_dreq(&dma_config, DREQ_ADC);
 
-    printf("Arming DMA\n");
+    static uint16_t capture[SAMPLE_COUNT];
+    static uint16_t averaged[SAMPLE_COUNT];
+    static uint32_t sums[SAMPLE_COUNT];
+    uint32_t frame_number = 0;
+
     sleep_ms(1000);
-    // Set up the DMA to start transferring data as soon as it appears in FIFO
-    uint dma_chan = dma_claim_unused_channel(true);
-    dma_channel_config cfg = dma_channel_get_default_config(dma_chan);
+    /* Prime the CCD once; subsequent SH edges define exact integration
+       intervals. This discarded read also removes power-up contents. */
+    capture_once(pio, gate_sm, dma_channel, &dma_config, capture);
+    absolute_time_t next_shift = get_absolute_time();
 
-    // Reading from constant address, writing to incrementing byte addresses
-    channel_config_set_transfer_data_size(&cfg, DMA_SIZE_16);
-    channel_config_set_read_increment(&cfg, false);
-    channel_config_set_write_increment(&cfg, true);
-
-    // Pace transfers based on availability of ADC samples
-    channel_config_set_dreq(&cfg, DREQ_ADC);
-
-    uint16_t capture_buf[CAPTURE_DEPTH];
-    uint16_t capture_buf_sum[CAPTURE_DEPTH];
-    while (true)
-    {
-        // Clear the capture buffer
-        memset(capture_buf_sum, 0, sizeof(capture_buf));
-        for (int i = 0; i < SIGNAL_AVERAGE; ++i)
-        {
-            memset(capture_buf, 0, sizeof(capture_buf));
-            control_sh_pin(5, SH_PULSE_ON, SH_PULSE_OFF);
-            adc_run(true);
-            // Control SH and ICG pins
-            gpio_put(ICG_PIN, 0); // without 74hc04
-            // delay before exposure for 60 cpu cycles (~300 ns)
-            __asm volatile("nop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\n");
-            __asm volatile("nop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\n");
-            gpio_put(SH_PIN, 1);
-            busy_wait_us_32(SH_PULSE_ON);
-            gpio_put(SH_PIN, 0);
-            busy_wait_us_32(5); // ICG pulse delay t1
-            gpio_put(ICG_PIN, 1); // without 74hc04
-            busy_wait_us_32(SH_PULSE_OFF - 5); 
-            // control_sh_pin(1000, 2, 8);
-            // adc_run(true);
-            dma_channel_configure(dma_chan, &cfg,
-                                  capture_buf,   // dst
-                                  &adc_hw->fifo, // src
-                                  CAPTURE_DEPTH, // transfer count
-                                  true           // start immediately
-            );
-
-            control_sh_pin(SH_PULSE_COUNT, SH_PULSE_ON, SH_PULSE_OFF);
-
-            // finish adc run and dma read
-            dma_channel_wait_for_finish_blocking(dma_chan);
-            // printf("\n\rCapture finished\n\r");
-            adc_run(false);
-            adc_fifo_drain();
-            // Add the captured data to the sum buffer
-            for (int j = 0; j < CAPTURE_DEPTH; ++j)
-            {
-                capture_buf_sum[j] = (int16_t)((int32_t)capture_buf[j] + (int16_t)capture_buf_sum[j]) / 2;
-            }
+    while (true) {
+        memset(sums, 0, sizeof(sums));
+        for (uint average = 0; average < FRAME_AVERAGES; ++average) {
+            /* Schedule SH-to-SH, rather than adding the 7.4 ms readout time
+               to the requested integration interval. */
+            next_shift = delayed_by_us(next_shift, INTEGRATION_US);
+            sleep_until(next_shift);
+            capture_once(pio, gate_sm, dma_channel, &dma_config, capture);
+            for (uint i = 0; i < SAMPLE_COUNT; ++i)
+                sums[i] += capture[i];
         }
-        printf("\n\rCapture finished\n\r");
-        print_capture_buffer(capture_buf_sum, CAPTURE_DEPTH);
-        sleep_ms(30);
+        for (uint i = 0; i < SAMPLE_COUNT; ++i)
+            averaged[i] =
+                (uint16_t)((sums[i] + FRAME_AVERAGES / 2u) / FRAME_AVERAGES);
+        send_frame(averaged, frame_number++);
     }
 }

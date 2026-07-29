@@ -4,9 +4,9 @@ if(WIN32)
 else()
     set(USERHOME $ENV{HOME})
 endif()
-set(sdkVersion 2.1.1)
+set(sdkVersion 2.3.0)
 set(toolchainVersion 14_2_Rel1)
-set(picotoolVersion 2.1.1)
+set(picotoolVersion 2.3.0)
 set(picoVscode ${USERHOME}/.pico-sdk/cmake/pico-vscode.cmake)
 if (EXISTS ${picoVscode})
     include(${picoVscode})
@@ -38,13 +38,13 @@ pico_sdk_init()
 
 # Add executable. Default name is the project name, version 0.1
 
-add_executable(TCD1304 TCD1304.c )
+add_executable(TCD1304 TCD1304.c)
 
 pico_set_program_name(TCD1304 "TCD1304")
 pico_set_program_version(TCD1304 "0.1")
 
-# Generate PIO header
-# pico_generate_pio_header(TCD1304 ${CMAKE_CURRENT_LIST_DIR}/resistor_dac.pio)
+# Generate the synchronized TCD1304 clock/gate programs.
+pico_generate_pio_header(TCD1304 ${CMAKE_CURRENT_LIST_DIR}/tcd1304.pio)
 
 # Modify the below lines to enable/disable output over UART/USB
 pico_enable_stdio_uart(TCD1304 0)

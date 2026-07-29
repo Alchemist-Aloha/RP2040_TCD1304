@@ -4,7 +4,17 @@
 
 This project implements a simple TCD1304 CCD driver using the Raspberry Pi Pico microcontroller. The TCD1304 is a 3648-pixel linear CCD sensor, and the Raspberry Pi Pico is a dual-core Cortex M0 microcontroller with a built-in 500 ksps ADC.
 
-To view the captured spectrum, upload the compiled UF2 file from `TCD1304.c`, and then run `plot.py` to visualize the data received via the USB serial port.
+To view the captured spectrum, flash `build/TCD1304.uf2`, install the desktop
+dependencies, and run the live viewer:
+
+```powershell
+python -m pip install matplotlib numpy pyserial
+python plot_spectrum.py --port COM14 --invert --first-pixel 32 --last-pixel 3680
+```
+
+Use `python plot_spectrum.py --help` for baseline subtraction and CSV export.
+The viewer validates CRC-32 on every binary frame and automatically
+resynchronizes after dropped or partial serial data.
 
 The image below shows the spectrum captured from the TCD1304 with a 100 µs integration time and averaging over 10 frames. The spectrum is inverted on the y-axis, meaning low photon count corresponds to high ADC values. The peak in the middle of the spectrum is due to a shadow on the CCD detector.
 
@@ -20,13 +30,20 @@ This project utilizes the typical drive circuit from the TCD1304 datasheet, excl
 
 The RP2040's ADC operates at 500 ksps, capturing data via DMA, which synchronizes with the 2 MHz Master Clock (MC) of the TCD1304. The integration time (Shift Gate cycle) is currently set to 100 µs, while the full 3648-pixel readout time is approximately 80 ms.
 
-Current timing provides basic functionality, but the stability of the signal is not ideal due to the unsynchronized nature of SH, ICG, and MC. Additionally, the ADC capability of the Raspberry Pi Pico limits the readout quality, providing only 12-bit resolution at 500 ksps with DMA.
+PIO state machine 0 generates the 2 MHz master clock. A second PIO state
+machine aligns ICG and SH to that clock with datasheet-compliant timing
+(`t2 = 500 ns`, `t3 = 1 us`, `t1 = 5 us`, and `t4 = 0 ns`). The RP2040 ADC
+still limits readout to 12-bit samples at 500 ksps.
 
 ![image](doc/timing.png)
 
-## To Do
+## Configuration
 
-- Use the second core to handle output work.
-- Use IRC to fine-tune the SH and ICG signals.
-- Implement RTOS for better timing control.
-- Consider using a different microcontroller with a better ADC, such as the STM32 family.
+The main acquisition settings are at the top of `TCD1304.c`:
+
+- `MC_FREQUENCY_HZ`: master clock frequency (2 MHz by default)
+- `INTEGRATION_US`: SH-to-SH integration period (10 ms by default)
+- `FRAME_AVERAGES`: number of frames in each true arithmetic mean
+
+`INTEGRATION_US` must remain longer than the approximately 7.4 ms required to
+capture 3694 samples with the RP2040 ADC.

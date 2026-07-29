@@ -1,0 +1,59 @@
+.program tcd1304_master_clock
+.side_set 1
+
+; One instruction is one half-cycle. The C setup selects a 4 MHz PIO
+; instruction rate, producing the TCD1304's nominal 2 MHz master clock.
+.wrap_target
+    nop side 0
+    nop side 1
+.wrap
+
+.program tcd1304_gates
+.side_set 1
+
+; SET controls SH. Side-set controls ICG. GPIO 14 is the master clock.
+; A word in TX FIFO requests one readout. The state machine then aligns all
+; gate transitions to master-clock edges:
+;   t2 = 500 ns, t3 = 1 us, t1 = 5 us, t4 = 0 ns.
+.wrap_target
+    pull block       side 1
+    wait 0 gpio 14   side 0
+    wait 1 gpio 14   side 0
+    wait 0 gpio 14   side 0
+    set pins, 1      side 0
+    wait 1 gpio 14   side 0
+    wait 0 gpio 14   side 0
+    wait 1 gpio 14   side 0
+    wait 0 gpio 14   side 0
+    set pins, 0      side 0
+    set x, 9         side 0
+delay_t1:
+    wait 1 gpio 14   side 0
+    wait 0 gpio 14   side 0
+    jmp x-- delay_t1 side 0
+    wait 1 gpio 14   side 1
+.wrap
+
+% c-sdk {
+static inline void tcd1304_master_clock_init(PIO pio, uint sm, uint offset,
+                                              uint pin, float clkdiv) {
+    pio_sm_config c = tcd1304_master_clock_program_get_default_config(offset);
+    sm_config_set_sideset_pins(&c, pin);
+    sm_config_set_clkdiv(&c, clkdiv);
+    pio_gpio_init(pio, pin);
+    pio_sm_set_consecutive_pindirs(pio, sm, pin, 1, true);
+    pio_sm_init(pio, sm, offset, &c);
+}
+
+static inline void tcd1304_gates_init(PIO pio, uint sm, uint offset,
+                                      uint sh_pin, uint icg_pin) {
+    pio_sm_config c = tcd1304_gates_program_get_default_config(offset);
+    sm_config_set_set_pins(&c, sh_pin, 1);
+    sm_config_set_sideset_pins(&c, icg_pin);
+    pio_gpio_init(pio, sh_pin);
+    pio_gpio_init(pio, icg_pin);
+    pio_sm_set_consecutive_pindirs(pio, sm, sh_pin, 1, true);
+    pio_sm_set_consecutive_pindirs(pio, sm, icg_pin, 1, true);
+    pio_sm_init(pio, sm, offset, &c);
+}
+%}
